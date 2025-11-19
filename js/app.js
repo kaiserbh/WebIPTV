@@ -1,6 +1,159 @@
 const PLAYER_POSTER = "https://bugsfreecdn.netlify.app/BugsfreeDefault/player-poster.webp";
 const DEFAULT_LOGO = "https://bugsfreecdn.netlify.app/BugsfreeDefault/logo.png";
 
+// --- Xtream Codes Support ---
+function isXtreamCodesUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+        const urlObj = new URL(url);
+        return (urlObj.pathname.includes('player_api.php') || 
+                urlObj.pathname.includes('get.php')) &&
+               (urlObj.searchParams.has('username') && urlObj.searchParams.has('password'));
+    } catch {
+        return false;
+    }
+}
+
+async function parseXtreamCodes(url) {
+    try {
+        const urlObj = new URL(url);
+        
+        // Check if it's M3U format (get.php with type=m3u_plus)
+        if (urlObj.pathname.includes('get.php')) {
+            if (!urlObj.searchParams.has('type')) {
+                urlObj.searchParams.set('type', 'm3u_plus');
+            }
+            if (!urlObj.searchParams.has('output')) {
+                urlObj.searchParams.set('output', 'ts');
+            }
+            
+            playerSpinner(true, "Loading Xtream Codes M3U playlist...");
+            const response = await fetch(urlObj.toString());
+            if (!response.ok) throw new Error('Failed to fetch Xtream Codes playlist');
+            const content = await response.text();
+            playerSpinner(false);
+            
+            // Parse as M3U
+            parseM3U(content);
+            localStorage.setItem('playlistName', 'Xtream Codes Playlist');
+            showPlayerNotification("✅ Xtream Codes playlist loaded successfully", 2200);
+            return true;
+        }
+        
+        // JSON API format (player_api.php)
+        if (urlObj.pathname.includes('player_api.php')) {
+            playerSpinner(true, "Loading Xtream Codes API...");
+            
+            const baseUrl = `${urlObj.protocol}//${urlObj.host}`;
+            const username = urlObj.searchParams.get('username');
+            const password = urlObj.searchParams.get('password');
+            
+            const userInfoUrl = `${baseUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
+            const userResponse = await fetch(userInfoUrl);
+            if (!userResponse.ok) throw new Error('Invalid Xtream Codes credentials');
+            const userInfo = await userResponse.json();
+            
+            if (userInfo.error) {
+                throw new Error(userInfo.error || 'Xtream Codes API error');
+            }
+            
+            if (userInfo.user_info) {
+                if (userInfo.user_info.status && userInfo.user_info.status !== 'Active') {
+                    throw new Error('Xtream Codes account is not active');
+                }
+            }
+            
+            const streamsUrl = `${baseUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&action=get_live_streams`;
+            const streamsResponse = await fetch(streamsUrl);
+            if (!streamsResponse.ok) throw new Error('Failed to fetch streams');
+            const streamsData = await streamsResponse.json();
+            
+            if (streamsData && streamsData.error) {
+                throw new Error(streamsData.error || 'Failed to fetch streams');
+            }
+            
+            const channels = [];
+            if (streamsData && Array.isArray(streamsData)) {
+                streamsData.forEach(stream => {
+                    if (stream.name) {
+                        let streamUrl;
+                        if (stream.stream_url) {
+                            streamUrl = stream.stream_url;
+                        } else if (stream.stream_id) {
+                            // Try different URL patterns for Xtream Codes streams
+                            // Most common: /live/username/password/stream_id.m3u8
+                            // Some servers use: /streaming/live/username/password/stream_id.m3u8
+                            // Or: /live/username/password/stream_id.ts
+                            streamUrl = `${baseUrl}/live/${username}/${password}/${stream.stream_id}.m3u8`;
+                        } else {
+                            return; 
+                        }
+                        
+                        channels.push({
+                            name: stream.name || 'Unknown Channel',
+                            url: streamUrl,
+                            logo: stream.stream_icon || stream.cover || null
+                        });
+                    }
+                });
+            }
+            
+            const vodUrl = `${baseUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&action=get_vod_streams`;
+            try {
+                const vodResponse = await fetch(vodUrl);
+                if (vodResponse.ok) {
+                    const vodData = await vodResponse.json();
+                    if (vodData && !vodData.error && Array.isArray(vodData)) {
+                        vodData.forEach(vod => {
+                            if (vod.name) {
+                                let vodStreamUrl;
+                                if (vod.stream_url) {
+                                    vodStreamUrl = vod.stream_url;
+                                } else if (vod.stream_id) {
+                                    // Try .m3u8 first (HLS format, most common for Xtream Codes)
+                                    vodStreamUrl = `${baseUrl}/movie/${username}/${password}/${vod.stream_id}.m3u8`;
+                                } else {
+                                    return; 
+                                }
+                                
+                                channels.push({
+                                    name: `[VOD] ${vod.name}`,
+                                    url: vodStreamUrl,
+                                    logo: vod.stream_icon || vod.cover || null
+                                });
+                            }
+                        });
+                    }
+                }
+            } catch (e) {
+                // VOD not available, continue with live streams only
+            }
+            
+            playerSpinner(false);
+            
+            if (channels.length > 0) {
+                allChannels = channels;
+                localStorage.setItem('lastPlaylist', JSON.stringify(channels));
+                localStorage.setItem('playlistName', 'Xtream Codes');
+                displayChannels(channels);
+                if (channels.length > 0) {
+                    playStream(channels[0].url);
+                }
+                showPlayerNotification(`✅ Loaded ${channels.length} channels from Xtream Codes`, 2200);
+            } else {
+                showPlayerNotification("❌ No channels found in Xtream Codes account", 3200);
+            }
+            return true;
+        }
+        
+        return false;
+    } catch (e) {
+        playerSpinner(false);
+        showPlayerNotification(`❌ Xtream Codes error: ${e.message}`, 3200);
+        return false;
+    }
+}
+
 // --- M3U Playlist Parser ---
 function parseM3U(content) {
     try {
@@ -343,13 +496,92 @@ function highlightPlaylist() {
     });
 }
 
+// --- Check if M3U8 contains MP4 segments and extract them ---
+async function checkM3U8ForMP4(m3u8Url) {
+    try {
+        const response = await fetch(m3u8Url);
+        if (!response.ok) return null;
+        const content = await response.text();
+        
+        // Check if it's a simple playlist with #EXT-X-ENDLIST (VOD/complete playlist)
+        if (!content.includes('#EXT-X-ENDLIST')) {
+            return null; // Live stream, let HLS.js handle it
+        }
+        
+        const lines = content.split('\n');
+        const baseUrlObj = new URL(m3u8Url);
+        const basePath = baseUrlObj.pathname.substring(0, baseUrlObj.pathname.lastIndexOf('/') + 1);
+        
+        // Look for media URLs in the playlist (lines after #EXTINF that aren't comments)
+        const mediaUrls = [];
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (!line || line.startsWith('#')) continue;
+            
+            // This line should be a media URL (comes after #EXTINF)
+            let mediaUrl = line;
+            
+            // Resolve relative URLs to absolute
+            if (!mediaUrl.startsWith('http')) {
+                if (mediaUrl.startsWith('//')) {
+                    mediaUrl = baseUrlObj.protocol + mediaUrl;
+                } else if (mediaUrl.startsWith('/')) {
+                    mediaUrl = baseUrlObj.origin + mediaUrl;
+                } else {
+                    mediaUrl = baseUrlObj.origin + basePath + mediaUrl;
+                }
+            }
+            
+            // If it contains .mp4, definitely include it
+            // Otherwise, if previous line was #EXTINF, it's likely a media segment
+            if (mediaUrl.includes('.mp4') || (i > 0 && lines[i - 1].trim().startsWith('#EXTINF'))) {
+                mediaUrls.push(mediaUrl);
+            }
+        }
+        
+        if (mediaUrls.length > 0) {
+            return mediaUrls[0]; 
+        }
+        
+        return null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// --- Check if URL is an offline/placeholder stream (down.mp4, offline.mp4, etc.) ---
+function isOfflineStream(url) {
+    if (!url) return false;
+    const urlLower = url.toLowerCase();
+    return urlLower.includes('down.mp4') || 
+           urlLower.includes('offline.mp4') || 
+           urlLower.includes('stream_offline') ||
+           urlLower.includes('channel_offline');
+}
+
 // --- ENCRYPTED URL UPDATE ON CHANNEL CHANGE ---
 async function playStream(url, retry = false, skipUpdateUrl = false) {
     if (!url) {
         showPlayerNotification("Bugsfree Studio", 2000);
         return;
     }
-    playerSpinner(true, "Loading Stream...");
+    if (window.currentHlsInstance) {
+        try {
+            window.currentHlsInstance.destroy();
+        } catch(e) {}
+        window.currentHlsInstance = null;
+    }
+    if (dashPlayer) {
+        try {
+            dashPlayer.reset();
+        } catch(e) {}
+        dashPlayer = null;
+    }
+    player.pause();
+    player.src = '';
+    player.load();
+    
+    playerSpinner(true, retry ? "Trying alternative format..." : "Loading Stream...");
     currentChannelUrl = url;
     highlightPlaylist();
     if (!skipUpdateUrl) {
@@ -357,42 +589,277 @@ async function playStream(url, retry = false, skipUpdateUrl = false) {
         window.history.replaceState({}, '', window.location.pathname + `?channel=${enc}`);
     }
     try {
-        if (dashPlayer) {
-            dashPlayer.reset(); dashPlayer = null;
-        }
-        function silentFail() {
+        let loadTimeout = null;
+        let errorTimeout = null;
+        let streamStarted = false;
+        let hlsInstance = null;
+        
+        function silentFail(errorMsg = null, showError = true) {
+            if (streamStarted && !errorMsg) return; 
             playerSpinner(false);
-            player.pause();
+            if (errorTimeout) clearTimeout(errorTimeout);
+            if (loadTimeout) clearTimeout(loadTimeout);
+            if (hlsInstance) {
+                try { hlsInstance.destroy(); } catch(e) {}
+                hlsInstance = null;
+            }
+            if (errorMsg && showError) {
+                showPlayerNotification(`❌ ${errorMsg}`, 4000);
+            }
         }
+        
+        loadTimeout = setTimeout(() => {
+            if (!streamStarted) {
+                silentFail("Stream loading timeout. The stream may be unavailable or the server is slow.", true);
+            }
+        }, 20000);
+        
         if (url.includes('.m3u8') || url.includes('.ts')) {
+            // Check if M3U8 contains MP4 segments - if so, try direct playback ONLY (no HLS.js fallback)
+            // This prevents HLS.js from trying to load MP4 via XHR which will fail with CORS
+            if (url.includes('.m3u8') && !retry) {
+                const mp4Url = await checkM3U8ForMP4(url);
+                if (mp4Url) {
+                    // Check if this is an offline/placeholder stream (down.mp4, etc.)
+                    if (isOfflineStream(mp4Url)) {
+                        playerSpinner(false);
+                        showPlayerNotification("📺 STREAM IS OFFLINE", 5000);
+                        return;
+                    }
+                    
+                    // We found a simple MP4 playlist - play it directly, don't use HLS.js
+                    // Try WITHOUT crossOrigin first - browsers are more lenient with video elements
+                    // Only set crossOrigin if we get an error
+                    player.crossOrigin = null; 
+                    
+                    // Try direct MP4 playback - this is the only way for simple MP4 playlists
+                    // DO NOT use HLS.js here as it will try to load MP4 via XHR and fail with CORS
+                    playerSpinner(true, "Loading MP4 stream...");
+                    player.src = mp4Url;
+                    
+                    player.oncanplay = () => {
+                        if (loadTimeout) clearTimeout(loadTimeout);
+                        setTimeout(() => {
+                            player.play().then(() => { 
+                                streamStarted = true;
+                                player.muted = false; 
+                                playerSpinner(false); 
+                            }).catch(() => {
+                                if (errorTimeout) clearTimeout(errorTimeout);
+                                errorTimeout = setTimeout(() => {
+                                    if (!streamStarted) {
+                                        try {
+                                            const mp4UrlObj = new URL(mp4Url);
+                                            const m3u8UrlObj = new URL(url);
+                                            if (mp4UrlObj.origin !== m3u8UrlObj.origin) {
+                                                player.crossOrigin = 'anonymous';
+                                                player.src = '';
+                                                player.load();
+                                                player.src = mp4Url; 
+                                            }
+                                        } catch(e) {
+                                            silentFail("Failed to play MP4 stream.", true);
+                                        }
+                                    }
+                                }, 2000);
+                            });
+                        }, 500);
+                    };
+                    
+                    player.addEventListener('playing', () => {
+                        streamStarted = true;
+                        if (loadTimeout) clearTimeout(loadTimeout);
+                        if (errorTimeout) clearTimeout(errorTimeout);
+                        playerSpinner(false);
+                    }, { once: true });
+                    
+                    player.onerror = () => {
+                        if (errorTimeout) clearTimeout(errorTimeout);
+                        errorTimeout = setTimeout(() => {
+                            if (!streamStarted) {
+                                try {
+                                    const mp4UrlObj = new URL(mp4Url);
+                                    const m3u8UrlObj = new URL(url);
+                                    if (mp4UrlObj.origin !== m3u8UrlObj.origin && player.crossOrigin === null) {
+                                        player.crossOrigin = 'anonymous';
+                                        player.src = '';
+                                        player.load();
+                                        player.src = mp4Url;
+                                        return; 
+                                    }
+                                } catch(e) {}
+                                
+                                silentFail("MP4 playback error. The stream may be unavailable.", true);
+                            }
+                        }, 3000);
+                    };
+                    
+                    // Return early - don't use HLS.js for simple MP4 playlists
+                    return;
+                }
+            }
+            
+            // For live streams, complex playlists, or .ts files, use HLS.js
             if (Hls.isSupported()) {
-                const hls = new Hls({ enableWorker: false });
-                hls.loadSource(url);
-                hls.attachMedia(player);
-                hls.on(Hls.Events.MANIFEST_PARSED, () => {
-                    player.play().then(() => { player.muted = false; playerSpinner(false); }).catch(silentFail);
+                    hlsInstance = new Hls({ 
+                        enableWorker: false,
+                        maxBufferLength: 30,
+                        maxMaxBufferLength: 60,
+                        startLevel: -1,
+                        xhrSetup: function(xhr, url) {
+                            xhr.withCredentials = false;
+                        },
+                        fragLoadingTimeOut: 20000,
+                        manifestLoadingTimeOut: 10000,
+                        levelLoadingTimeOut: 10000
+                    });
+                window.currentHlsInstance = hlsInstance; 
+                hlsInstance.loadSource(url);
+                hlsInstance.attachMedia(player);
+                
+                hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+                    if (loadTimeout) clearTimeout(loadTimeout);
+                    // Give a small delay before trying to play
+                    setTimeout(() => {
+                        player.play().then(() => { 
+                            streamStarted = true;
+                            player.muted = false; 
+                            playerSpinner(false);
+                        }).catch((e) => {
+                            // Don't show error immediately - wait a bit to see if it recovers
+                            if (errorTimeout) clearTimeout(errorTimeout);
+                            errorTimeout = setTimeout(() => {
+                                if (!streamStarted && player.readyState < 2) {
+                                    silentFail("Failed to play stream. Check if the stream URL is correct.", true);
+                                }
+                            }, 5000);
+                        });
+                    }, 500);
                 });
-                hls.on(Hls.Events.ERROR, (event, data) => {
-                    silentFail();
+                
+                // Track when stream actually starts playing
+                player.addEventListener('playing', () => {
+                    streamStarted = true;
+                    if (loadTimeout) clearTimeout(loadTimeout);
+                    if (errorTimeout) clearTimeout(errorTimeout);
+                    playerSpinner(false);
+                }, { once: true });
+                
+                hlsInstance.on(Hls.Events.ERROR, (event, data) => {
+                    // Only handle fatal errors, and add delay before showing error
+                    if (data.fatal) {
+                        switch(data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                // If .m3u8 fails, try .ts format as fallback (for Xtream Codes)
+                                if (url.endsWith('.m3u8') && !retry && !streamStarted) {
+                                    if (hlsInstance) hlsInstance.destroy();
+                                    playerSpinner(true, "Trying alternative format...");
+                                    const tsUrl = url.replace('.m3u8', '.ts');
+                                    setTimeout(() => {
+                                        playStream(tsUrl, true, skipUpdateUrl);
+                                    }, 1000);
+                                    return;
+                                }
+                                if (errorTimeout) clearTimeout(errorTimeout);
+                                errorTimeout = setTimeout(() => {
+                                    if (!streamStarted) {
+                                        silentFail("Network error. Check your connection or try a different stream.", true);
+                                    }
+                                }, 5000);
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                try {
+                                    hlsInstance.recoverMediaError();
+                                } catch (e) {
+                                    if (errorTimeout) clearTimeout(errorTimeout);
+                                    errorTimeout = setTimeout(() => {
+                                        if (!streamStarted) {
+                                            silentFail("Media error. The stream format may not be supported.", true);
+                                        }
+                                    }, 5000);
+                                }
+                                break;
+                            default:
+                                if (errorTimeout) clearTimeout(errorTimeout);
+                                errorTimeout = setTimeout(() => {
+                                    if (!streamStarted) {
+                                        silentFail(`Stream error: ${data.type}`, true);
+                                    }
+                                }, 5000);
+                        }
+                    }
                 });
             } else {
-                silentFail();
+                silentFail("HLS is not supported in this browser.", true);
             }
         } else if (url.includes('.mpd')) {
             dashPlayer = dashjs.MediaPlayer().create();
             dashPlayer.initialize(player, url, true);
             dashPlayer.on(dashjs.MediaPlayer.events.STREAM_INITIALIZED, () => {
-                player.play().then(() => { player.muted = false; playerSpinner(false); }).catch(silentFail);
+                if (loadTimeout) clearTimeout(loadTimeout);
+                setTimeout(() => {
+                    player.play().then(() => { 
+                        streamStarted = true;
+                        player.muted = false; 
+                        playerSpinner(false); 
+                    }).catch(() => {
+                        if (errorTimeout) clearTimeout(errorTimeout);
+                        errorTimeout = setTimeout(() => {
+                            if (!streamStarted) {
+                                silentFail("Failed to play DASH stream.", true);
+                            }
+                        }, 3000);
+                    });
+                }, 500);
             });
-            dashPlayer.on(dashjs.MediaPlayer.events.ERROR, () => { silentFail(); });
+            player.addEventListener('playing', () => {
+                streamStarted = true;
+                if (loadTimeout) clearTimeout(loadTimeout);
+                if (errorTimeout) clearTimeout(errorTimeout);
+                playerSpinner(false);
+            }, { once: true });
+            dashPlayer.on(dashjs.MediaPlayer.events.ERROR, () => {
+                if (errorTimeout) clearTimeout(errorTimeout);
+                errorTimeout = setTimeout(() => {
+                    if (!streamStarted) {
+                        silentFail("DASH stream error. The stream may be unavailable.", true);
+                    }
+                }, 5000);
+            });
         } else if (url.includes('.mp4') || url.match(/^(http|https|rtmp):\/\//)) {
             player.src = url;
             player.oncanplay = () => {
-                player.play().then(() => { playerSpinner(false); }).catch(silentFail);
+                if (loadTimeout) clearTimeout(loadTimeout);
+                setTimeout(() => {
+                    player.play().then(() => { 
+                        streamStarted = true;
+                        playerSpinner(false); 
+                    }).catch(() => {
+                        if (errorTimeout) clearTimeout(errorTimeout);
+                        errorTimeout = setTimeout(() => {
+                            if (!streamStarted) {
+                                silentFail("Failed to play video stream.", true);
+                            }
+                        }, 3000);
+                    });
+                }, 500);
             };
-            player.onerror = () => { silentFail(); };
+            player.addEventListener('playing', () => {
+                streamStarted = true;
+                if (loadTimeout) clearTimeout(loadTimeout);
+                if (errorTimeout) clearTimeout(errorTimeout);
+                playerSpinner(false);
+            }, { once: true });
+            player.onerror = () => {
+                if (errorTimeout) clearTimeout(errorTimeout);
+                errorTimeout = setTimeout(() => {
+                    if (!streamStarted) {
+                        silentFail("Video playback error. The stream may be unavailable or unsupported.", true);
+                    }
+                }, 5000);
+            };
         } else {
-            silentFail();
+            silentFail("Unsupported stream format.", true);
         }
     } catch (e) {
         playerSpinner(false);
@@ -595,7 +1062,9 @@ async function loadHistoryFile(index) {
             }
         }
     } else if (item.type === 'url' && item.url) {
-        if (item.url.endsWith('.m3u')) {
+        if (isXtreamCodesUrl(item.url)) {
+            await parseXtreamCodes(item.url);
+        } else if (item.url.endsWith('.m3u')) {
             fetch(item.url)
                 .then(res => res.text())
                 .then(parseM3U)
@@ -765,7 +1234,7 @@ fileInput.addEventListener('change', (e) => {
     reader.readAsText(file);
 });
 
-loadUrlBtn.addEventListener('click', () => {
+loadUrlBtn.addEventListener('click', async () => {
     const url = urlInput.value.trim();
     if (!url) return;
     if (isDuplicateUpload({ type: 'url', name: url, url })) {
@@ -775,6 +1244,15 @@ loadUrlBtn.addEventListener('click', () => {
     history.push({ type: 'url', name: url, url });
     localStorage.setItem('history', JSON.stringify(history));
     displayHistory();
+    
+    if (isXtreamCodesUrl(url)) {
+        const success = await parseXtreamCodes(url);
+        if (success) {
+            urlInput.value = "";
+            return;
+        }
+    }
+    
     if (url.endsWith('.m3u')) {
         fetch(url)
             .then(res => res.text())
